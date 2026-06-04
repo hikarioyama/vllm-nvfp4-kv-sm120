@@ -1,0 +1,26 @@
+nvfp4-kv-sm120
+Copyright 2026 the nvfp4-kv-sm120 contributors
+
+This product includes modified source files from:
+
+  FlashInfer (https://github.com/flashinfer-ai/flashinfer)
+    Copyright (c) by FlashInfer team. Licensed under Apache-2.0.
+    Modified files:
+      - flashinfer/data/include/flashinfer/attention/prefill.cuh
+          page_produce_kv_sf / produce_kv_sf now take explicit SF strides
+          (sf_stride_page/h/n) instead of deriving them as data_stride/SF_CONTAINERS;
+          the 3 prefill kernels read params.maybe_{k,v}_cache_sf_stride_* and pass
+          K-strides to K-calls and V-strides to V-calls.
+      - flashinfer/jit/attention/utils.py
+          generate_additional_params auto-emits <name>_stride_page/h/n Params fields
+          and a layout-aware setter for the maybe_{k,v}_cache_sf additional tensors.
+
+  vLLM (https://github.com/vllm-project/vllm)
+    Copyright contributors to the vLLM project. Licensed under Apache-2.0.
+    Modified files:
+      - vllm/v1/attention/backends/flashinfer.py
+          SM120 NVFP4-KV path via FlashInfer FA2: K read directly from the interleaved
+          cache view, V de-swizzled into a contiguous per-layer SF cache, incremental
+          CUDA-graph-safe fill, explicit-SF-stride integration.
+
+See LICENSE (Apache-2.0) for the full license text.

@@ -1,0 +1,288 @@
+--- a/flashinfer/data/include/flashinfer/attention/prefill.cuh
++++ b/flashinfer/data/include/flashinfer/attention/prefill.cuh
+@@ -436,9 +436,9 @@
+  * SF bytes per iteration, advancing by NUM_WARPS * 128 bytes across iterations.
+  * The SF smem layout is a plain flat byte array — no swizzle.
+  *
+- * SF strides are KV byte strides divided by SF_CONTAINERS (= NVFP4_SF_VEC_SIZE/2 = 8),
+- * which is exact because all NVFP4-compatible head_dims are divisible by 16.
+- * No-op when KTraits::DTypeKV is not FP4.
++ * SF strides (sf_stride_page/h/n) are passed explicitly by the caller (no longer derived
++ * as data_stride/SF_CONTAINERS), so the SF source may be the interleaved cache view (K) or
++ * a separate contiguous de-swizzled cache (V). No-op when KTraits::DTypeKV is not FP4.
+  *
+  * \tparam produce_v  true → fill v_sf_smem, false → fill k_sf_smem.
+  * \tparam KTraits    Kernel traits type.
+@@ -448,9 +448,9 @@
+  * \param packed_page_iter_base  Packed page-iter for the start of this CTA tile.
+  * \param packed_kv_bound     Upper bound for valid packed page-iters (last_indptr * page_size).
+  * \param kv_head_idx         KV head index.
+- * \param kv_stride_page      Byte stride per page in the KV tensor.
+- * \param kv_stride_h         Byte stride per head in the KV tensor.
+- * \param kv_stride_n         Byte stride per token in the KV tensor.
++ * \param sf_stride_page      Byte stride per page in the SF tensor (explicit, not data/8).
++ * \param sf_stride_h         Byte stride per head in the SF tensor.
++ * \param sf_stride_n         Byte stride per token in the SF tensor.
+  * \param page_size           Page size (fast divisor).
+  * \param indices             Page index array.
+  * \param kv_idx_base         First KV row index for this tile within the chunk.
+@@ -462,8 +462,8 @@
+ __device__ __forceinline__ void page_produce_kv_sf(
+     typename KTraits::SharedStorage* smem_storage, uint8_t* sf_ptr,
+     const uint32_t packed_page_iter_base, const uint32_t packed_kv_bound,
+-    const uint32_t kv_head_idx, const uint32_t kv_stride_page, const uint32_t kv_stride_h,
+-    const uint32_t kv_stride_n, const uint_fastdiv& page_size, const IdType* indices,
++    const uint32_t kv_head_idx, const uint32_t sf_stride_page, const uint32_t sf_stride_h,
++    const uint32_t sf_stride_n, const uint_fastdiv& page_size, const IdType* indices,
+     const uint32_t kv_idx_base, const uint32_t kv_len, const uint32_t warp_idx,
+     const uint32_t lane_idx) {
+   if constexpr (!is_fp4_type_v<typename KTraits::DTypeKV>) return;
+@@ -473,7 +473,7 @@
+   constexpr uint32_t NUM_WARPS = KTraits::NUM_WARPS;
+   constexpr uint32_t CTA_TILE_KV = KTraits::CTA_TILE_KV;
+   // DTypeKV containers per SF byte: NVFP4_SF_VEC_SIZE FP4 / 2 FP4-per-container.
+-  constexpr uint32_t SF_CONTAINERS = NVFP4_SF_VEC_SIZE / 2;  // = 8
++  [[maybe_unused]] constexpr uint32_t SF_CONTAINERS = NVFP4_SF_VEC_SIZE / 2;  // = 8
+   constexpr uint32_t SF_TOTAL_BYTES = CTA_TILE_KV * SF_COLS;
+   static_assert(SF_TOTAL_BYTES % 4 == 0, "SF smem size must be 4-byte aligned for 32-bit LDGSTS");
+   // Each thread loads 4 SF bytes (32 bits) per iteration via LDGSTS.32.
+@@ -494,15 +494,16 @@
+     // For k < NUM_SF_ITERS-1, (flat_byte < SF_TOTAL_BYTES) is always true (optimized away).
+     const bool in_bounds = (flat_byte < SF_TOTAL_BYTES) && (kv_idx_base + sf_smem_row < kv_len);
+ 
+-    // SF strides are KV byte strides / SF_CONTAINERS (1 SF byte per SF_CONTAINERS KV containers).
++    // SF strides are passed explicitly (sf_stride_*), so K can be read directly from the
++    // interleaved cache view and V from a contiguous de-swizzled cache (no data/8 over-alloc).
+     // packed_kv_bound guards indices[] access; returns offset 0 for out-of-range rows.
+     uint32_t page_iter, entry_idx;
+     const uint32_t packed_block_iter = packed_page_iter_base + sf_smem_row;
+     page_size.divmod(packed_block_iter, page_iter, entry_idx);
+     const size_t sf_gmem_offset =
+         static_cast<size_t>(packed_block_iter < packed_kv_bound ? indices[page_iter] : 0) *
+-            (kv_stride_page / SF_CONTAINERS) +
+-        kv_head_idx * (kv_stride_h / SF_CONTAINERS) + entry_idx * (kv_stride_n / SF_CONTAINERS) +
++            sf_stride_page +
++        kv_head_idx * sf_stride_h + entry_idx * sf_stride_n +
+         sf_smem_col;
+ 
+     // V SF must zero-fill out-of-bounds entries: compute_sfm_v reads SF for all CTA_TILE_KV rows
+@@ -523,7 +524,7 @@
+  * Contiguous analog of page_produce_kv_sf — no page indirection.
+  * kv_abs_base is the absolute first token index for this CTA tile
+  * (kv_indptr[request_idx] + chunk_start for ragged, chunk_start for single prefill).
+- * SF strides are KV byte strides / SF_CONTAINERS (exact for all valid head_dims).
++ * SF strides (sf_stride_n/h) are passed explicitly by the caller.
+  * No-op when DTypeKV is not FP4.
+  *
+  * \tparam produce_v  true → fill v_sf_smem, false → fill k_sf_smem.
+@@ -532,8 +533,8 @@
+  * \param sf_ptr              Base pointer to the flat uint8_t SF array (K or V).
+  * \param kv_abs_base         Absolute first token index for this CTA tile.
+  * \param kv_head_idx         KV head index.
+- * \param kv_stride_n         Byte stride per token in the KV tensor.
+- * \param kv_stride_h         Byte stride per head in the KV tensor.
++ * \param sf_stride_n         Byte stride per token in the SF tensor (explicit, not data/8).
++ * \param sf_stride_h         Byte stride per head in the SF tensor.
+  * \param kv_idx_base         First KV row index for this tile within the chunk.
+  * \param kv_len              Chunk size; rows at or beyond this are not loaded.
+  * \param warp_idx            Global warp index within the CTA.
+@@ -543,8 +544,8 @@
+ __device__ __forceinline__ void produce_kv_sf(typename KTraits::SharedStorage* smem_storage,
+                                               uint8_t* sf_ptr, const uint32_t kv_abs_base,
+                                               const uint32_t kv_head_idx,
+-                                              const uint32_t kv_stride_n,
+-                                              const uint32_t kv_stride_h,
++                                              const uint32_t sf_stride_n,
++                                              const uint32_t sf_stride_h,
+                                               const uint32_t kv_idx_base, const uint32_t kv_len,
+                                               const uint32_t warp_idx, const uint32_t lane_idx) {
+   if constexpr (!is_fp4_type_v<typename KTraits::DTypeKV>) return;
+@@ -554,7 +555,7 @@
+   constexpr uint32_t NUM_WARPS = KTraits::NUM_WARPS;
+   constexpr uint32_t CTA_TILE_KV = KTraits::CTA_TILE_KV;
+   // DTypeKV containers per SF byte: NVFP4_SF_VEC_SIZE FP4 / 2 FP4-per-container.
+-  constexpr uint32_t SF_CONTAINERS = NVFP4_SF_VEC_SIZE / 2;  // = 8
++  [[maybe_unused]] constexpr uint32_t SF_CONTAINERS = NVFP4_SF_VEC_SIZE / 2;  // = 8
+   constexpr uint32_t SF_TOTAL_BYTES = CTA_TILE_KV * SF_COLS;
+   static_assert(SF_TOTAL_BYTES % 4 == 0, "SF smem size must be 4-byte aligned for 32-bit LDGSTS");
+   // Each thread loads 4 SF bytes (32 bits) per iteration via LDGSTS.32.
+@@ -563,8 +564,6 @@
+ 
+   uint8_t* sf_smem = produce_v ? smem_storage->v_sf_smem : smem_storage->k_sf_smem;
+   const uint32_t thread_id = warp_idx * 32 + lane_idx;
+-  const uint32_t sf_stride_n = kv_stride_n / SF_CONTAINERS;
+-  const uint32_t sf_stride_h = kv_stride_h / SF_CONTAINERS;
+ 
+ #pragma unroll
+   for (uint32_t i = 0; i < NUM_SF_ITERS; ++i) {
+@@ -1643,12 +1642,22 @@
+     const uint_fastdiv& group_size = params.group_size;
+ 
+     uint8_t* maybe_k_cache_sf = nullptr;
++    [[maybe_unused]] uint32_t sf_k_stride_page = 0;
++    uint32_t sf_k_stride_h = 0, sf_k_stride_n = 0;
+     if constexpr (has_maybe_k_cache_sf_v<Params>) {
+       maybe_k_cache_sf = params.maybe_k_cache_sf;
++      sf_k_stride_page = params.maybe_k_cache_sf_stride_page;
++      sf_k_stride_h = params.maybe_k_cache_sf_stride_h;
++      sf_k_stride_n = params.maybe_k_cache_sf_stride_n;
+     }
+     uint8_t* maybe_v_cache_sf = nullptr;
++    [[maybe_unused]] uint32_t sf_v_stride_page = 0;
++    uint32_t sf_v_stride_h = 0, sf_v_stride_n = 0;
+     if constexpr (has_maybe_v_cache_sf_v<Params>) {
+       maybe_v_cache_sf = params.maybe_v_cache_sf;
++      sf_v_stride_page = params.maybe_v_cache_sf_stride_page;
++      sf_v_stride_h = params.maybe_v_cache_sf_stride_h;
++      sf_v_stride_n = params.maybe_v_cache_sf_stride_n;
+     }
+ 
+     static_assert(sizeof(DTypeQ) == 2);
+@@ -1754,12 +1763,12 @@
+     produce_kv<false, SharedMemFillMode::kNoFill, KTraits>(k_smem, &k_smem_offset_w, &k_ptr,
+                                                            k_stride_n, 0, chunk_size, tid);
+     produce_kv_sf<false, KTraits>(&smem_storage, maybe_k_cache_sf, kv_abs_base, kv_head_idx,
+-                                  k_stride_n, k_stride_h, 0, chunk_size, warp_idx, lane_idx);
++                                  sf_k_stride_n, sf_k_stride_h, 0, chunk_size, warp_idx, lane_idx);
+     cp_async::commit_group();
+     produce_kv<true, SharedMemFillMode::kFillZero, KTraits>(v_smem, &v_smem_offset_w, &v_ptr,
+                                                             v_stride_n, 0, chunk_size, tid);
+     produce_kv_sf<true, KTraits>(&smem_storage, maybe_v_cache_sf, kv_abs_base, kv_head_idx,
+-                                 v_stride_n, v_stride_h, 0, chunk_size, warp_idx, lane_idx);
++                                 sf_v_stride_n, sf_v_stride_h, 0, chunk_size, warp_idx, lane_idx);
+     cp_async::commit_group();
+ 
+ #pragma unroll 1
+@@ -1797,7 +1806,7 @@
+       produce_kv<false, SharedMemFillMode::kNoFill, KTraits>(
+           k_smem, &k_smem_offset_w, &k_ptr, k_stride_n, (iter + 1) * CTA_TILE_KV, chunk_size, tid);
+       produce_kv_sf<false, KTraits>(&smem_storage, maybe_k_cache_sf, kv_abs_base, kv_head_idx,
+-                                    k_stride_n, k_stride_h, (iter + 1) * CTA_TILE_KV, chunk_size,
++                                    sf_k_stride_n, sf_k_stride_h, (iter + 1) * CTA_TILE_KV, chunk_size,
+                                     warp_idx, lane_idx);
+       cp_async::commit_group();
+       cp_async::wait_group<1>();
+@@ -1814,7 +1823,7 @@
+       produce_kv<true, SharedMemFillMode::kFillZero, KTraits>(
+           v_smem, &v_smem_offset_w, &v_ptr, v_stride_n, (iter + 1) * CTA_TILE_KV, chunk_size, tid);
+       produce_kv_sf<true, KTraits>(&smem_storage, maybe_v_cache_sf, kv_abs_base, kv_head_idx,
+-                                   v_stride_n, v_stride_h, (iter + 1) * CTA_TILE_KV, chunk_size,
++                                   sf_v_stride_n, sf_v_stride_h, (iter + 1) * CTA_TILE_KV, chunk_size,
+                                    warp_idx, lane_idx);
+       cp_async::commit_group();
+     }
+@@ -2063,12 +2072,22 @@
+     const uint_fastdiv& group_size = params.group_size;
+ 
+     uint8_t* maybe_k_cache_sf = nullptr;
++    [[maybe_unused]] uint32_t sf_k_stride_page = 0;
++    uint32_t sf_k_stride_h = 0, sf_k_stride_n = 0;
+     if constexpr (has_maybe_k_cache_sf_v<Params>) {
+       maybe_k_cache_sf = params.maybe_k_cache_sf;
++      sf_k_stride_page = params.maybe_k_cache_sf_stride_page;
++      sf_k_stride_h = params.maybe_k_cache_sf_stride_h;
++      sf_k_stride_n = params.maybe_k_cache_sf_stride_n;
+     }
+     uint8_t* maybe_v_cache_sf = nullptr;
++    [[maybe_unused]] uint32_t sf_v_stride_page = 0;
++    uint32_t sf_v_stride_h = 0, sf_v_stride_n = 0;
+     if constexpr (has_maybe_v_cache_sf_v<Params>) {
+       maybe_v_cache_sf = params.maybe_v_cache_sf;
++      sf_v_stride_page = params.maybe_v_cache_sf_stride_page;
++      sf_v_stride_h = params.maybe_v_cache_sf_stride_h;
++      sf_v_stride_n = params.maybe_v_cache_sf_stride_n;
+     }
+ 
+     static_assert(sizeof(DTypeQ) == 2);
+@@ -2217,12 +2236,12 @@
+     produce_kv<false, SharedMemFillMode::kNoFill, KTraits>(k_smem, &k_smem_offset_w, &k_ptr,
+                                                            k_stride_n, 0, chunk_size, tid);
+     produce_kv_sf<false, KTraits>(&smem_storage, maybe_k_cache_sf, kv_abs_base, kv_head_idx,
+-                                  k_stride_n, k_stride_h, 0, chunk_size, warp_idx, lane_idx);
++                                  sf_k_stride_n, sf_k_stride_h, 0, chunk_size, warp_idx, lane_idx);
+     cp_async::commit_group();
+     produce_kv<true, SharedMemFillMode::kFillZero, KTraits>(v_smem, &v_smem_offset_w, &v_ptr,
+                                                             v_stride_n, 0, chunk_size, tid);
+     produce_kv_sf<true, KTraits>(&smem_storage, maybe_v_cache_sf, kv_abs_base, kv_head_idx,
+-                                 v_stride_n, v_stride_h, 0, chunk_size, warp_idx, lane_idx);
++                                 sf_v_stride_n, sf_v_stride_h, 0, chunk_size, warp_idx, lane_idx);
+     cp_async::commit_group();
+ 
+ #pragma unroll 1
+@@ -2267,7 +2286,7 @@
+       produce_kv<false, SharedMemFillMode::kNoFill, KTraits>(
+           k_smem, &k_smem_offset_w, &k_ptr, k_stride_n, (iter + 1) * CTA_TILE_KV, chunk_size, tid);
+       produce_kv_sf<false, KTraits>(&smem_storage, maybe_k_cache_sf, kv_abs_base, kv_head_idx,
+-                                    k_stride_n, k_stride_h, (iter + 1) * CTA_TILE_KV, chunk_size,
++                                    sf_k_stride_n, sf_k_stride_h, (iter + 1) * CTA_TILE_KV, chunk_size,
+                                     warp_idx, lane_idx);
+       cp_async::commit_group();
+       cp_async::wait_group<1>();
+@@ -2284,7 +2303,7 @@
+       produce_kv<true, SharedMemFillMode::kFillZero, KTraits>(
+           v_smem, &v_smem_offset_w, &v_ptr, v_stride_n, (iter + 1) * CTA_TILE_KV, chunk_size, tid);
+       produce_kv_sf<true, KTraits>(&smem_storage, maybe_v_cache_sf, kv_abs_base, kv_head_idx,
+-                                   v_stride_n, v_stride_h, (iter + 1) * CTA_TILE_KV, chunk_size,
++                                   sf_v_stride_n, sf_v_stride_h, (iter + 1) * CTA_TILE_KV, chunk_size,
+                                    warp_idx, lane_idx);
+       cp_async::commit_group();
+     }
+@@ -2410,12 +2429,22 @@
+       maybe_max_item_len_ptr = params.maybe_max_item_len_ptr;
+     }
+     uint8_t* maybe_k_cache_sf = nullptr;
++    [[maybe_unused]] uint32_t sf_k_stride_page = 0;
++    uint32_t sf_k_stride_h = 0, sf_k_stride_n = 0;
+     if constexpr (has_maybe_k_cache_sf_v<Params>) {
+       maybe_k_cache_sf = params.maybe_k_cache_sf;
++      sf_k_stride_page = params.maybe_k_cache_sf_stride_page;
++      sf_k_stride_h = params.maybe_k_cache_sf_stride_h;
++      sf_k_stride_n = params.maybe_k_cache_sf_stride_n;
+     }
+     uint8_t* maybe_v_cache_sf = nullptr;
++    [[maybe_unused]] uint32_t sf_v_stride_page = 0;
++    uint32_t sf_v_stride_h = 0, sf_v_stride_n = 0;
+     if constexpr (has_maybe_v_cache_sf_v<Params>) {
+       maybe_v_cache_sf = params.maybe_v_cache_sf;
++      sf_v_stride_page = params.maybe_v_cache_sf_stride_page;
++      sf_v_stride_h = params.maybe_v_cache_sf_stride_h;
++      sf_v_stride_n = params.maybe_v_cache_sf_stride_n;
+     }
+ 
+     static_assert(sizeof(DTypeQ) == 2);
+@@ -2538,7 +2567,7 @@
+                                     thr_local_kv_offset, chunk_size, warp_idx, lane_idx);
+     page_produce_kv_sf<false, KTraits>(&smem_storage, maybe_k_cache_sf, packed_page_iter_base,
+                                        last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx,
+-                                       paged_kv.stride_page, paged_kv.stride_h, paged_kv.stride_n,
++                                       sf_k_stride_page, sf_k_stride_h, sf_k_stride_n,
+                                        paged_kv.page_size, paged_kv.indices, 0, chunk_size,
+                                        warp_idx, lane_idx);
+     cp_async::commit_group();
+@@ -2546,7 +2575,7 @@
+                                    thr_local_kv_offset, chunk_size, warp_idx, lane_idx);
+     page_produce_kv_sf<true, KTraits>(&smem_storage, maybe_v_cache_sf, packed_page_iter_base,
+                                       last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx,
+-                                      paged_kv.stride_page, paged_kv.stride_h, paged_kv.stride_n,
++                                      sf_v_stride_page, sf_v_stride_h, sf_v_stride_n,
+                                       paged_kv.page_size, paged_kv.indices, 0, chunk_size, warp_idx,
+                                       lane_idx);
+     cp_async::commit_group();
+@@ -2691,7 +2720,7 @@
+                                       warp_idx, lane_idx);
+       page_produce_kv_sf<false, KTraits>(&smem_storage, maybe_k_cache_sf, packed_page_iter_base,
+                                          last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx,
+-                                         paged_kv.stride_page, paged_kv.stride_h, paged_kv.stride_n,
++                                         sf_k_stride_page, sf_k_stride_h, sf_k_stride_n,
+                                          paged_kv.page_size, paged_kv.indices,
+                                          (iter + 1) * CTA_TILE_KV, chunk_size, warp_idx, lane_idx);
+       cp_async::commit_group();
+@@ -2711,7 +2740,7 @@
+                                      warp_idx, lane_idx);
+       page_produce_kv_sf<true, KTraits>(&smem_storage, maybe_v_cache_sf, packed_page_iter_base,
+                                         last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx,
+-                                        paged_kv.stride_page, paged_kv.stride_h, paged_kv.stride_n,
++                                        sf_v_stride_page, sf_v_stride_h, sf_v_stride_n,
+                                         paged_kv.page_size, paged_kv.indices,
+                                         (iter + 1) * CTA_TILE_KV, chunk_size, warp_idx, lane_idx);
+       cp_async::commit_group();

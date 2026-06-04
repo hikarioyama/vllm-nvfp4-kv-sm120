@@ -1693,47 +1693,26 @@ class FlashInferImpl(AttentionImpl):
                 kv_cache_permute
             )
             if self.use_fa2_nvfp4_kv:
-                # SM120 native fa2 NVFP4 read with EXPLICIT SF strides (Task B):
-                # K-SF is read straight from the interleaved cache view (zero-copy,
-                # K is stored linear); V-SF is de-swizzled into a CONTIGUOUS cache
-                # (+5.5% pool vs the old +25% sparse K+V). The kernel derives both
-                # SF strides from these tensors (binding reads .stride()). Global
-                # per-tensor scales go through k_scale/v_scale at the run() sites.
+                # SM120 native fa2 NVFP4 read, B2 in-kernel V de-swizzle: K-SF AND V-SF are
+                # both read straight from the interleaved cache view (zero-copy). K is stored
+                # linear; V-SF is stored trtllm-swizzled and the kernel de-swizzles it per
+                # element inside page_produce_kv_sf<true> (prefill.cuh). No separate contiguous
+                # V-SF cache (was +5.5% pool), no Triton de-swizzle fill -> zero extra cache,
+                # full graph-capturable. The kernel derives SF strides from these tensors
+                # (binding reads .stride()); global scales go via k_scale/v_scale at run().
                 k_sf, v_sf = nvfp4_kv_block_scales  # interleaved views (K linear, V swizzled)
-                if self._fa2_sf_cache is not None:
-                    # Task A/B: V-SF was de-swizzled incrementally at cache-update
-                    # time into a persistent contiguous cache -> forward() just
-                    # reads fixed tensors (no dynamic repack -> CUDA-graph capturable).
-                    v_dst = self._fa2_sf_cache
-                    if _NVFP4_DBG and not getattr(self, "_fa2_dbg", False):
-                        self._fa2_dbg = True
-                        logger.info(
-                            "NVFP4DBG fwd layer=%s PERSIST(V-only) vnz=%d vshape=%s "
-                            "k_direct_shape=%s",
-                            getattr(layer, "layer_name", "?"),
-                            int((v_dst != 0).sum()),
-                            tuple(v_dst.shape),
-                            tuple(k_sf.shape),
-                        )
-                    nvfp4_kv_block_scales = (
-                        k_sf.view(torch.float8_e4m3fn),
-                        v_dst.view(torch.float8_e4m3fn),
+                if _NVFP4_DBG and not getattr(self, "_fa2_dbg", False):
+                    self._fa2_dbg = True
+                    logger.info(
+                        "NVFP4DBG fwd layer=%s B2(in-kernel V deswz) kshape=%s vshape=%s",
+                        getattr(layer, "layer_name", "?"),
+                        tuple(k_sf.shape),
+                        tuple(v_sf.shape),
                     )
-                else:
-                    # Fallback (before first cache update / KV-sharing layer):
-                    # K direct from the view, V de-swizzled dynamically into a
-                    # contiguous scratch for the referenced pages. Correct but NOT
-                    # graph-capturable (forces eager for this layer/step).
-                    v_scr = _get_nvfp4_v_sf_scratch(v_sf)
-                    pages = getattr(attn_metadata, "nvfp4_paged_kv_indices", None)
-                    if pages is not None and pages.numel() > 0:
-                        v_scr[pages] = _trtllm_v_scale_to_linear_for_fa2(
-                            v_sf[pages], get_kv_cache_layout()
-                        )
-                    nvfp4_kv_block_scales = (
-                        k_sf.view(torch.float8_e4m3fn),
-                        v_scr.view(torch.float8_e4m3fn),
-                    )
+                nvfp4_kv_block_scales = (
+                    k_sf.view(torch.float8_e4m3fn),
+                    v_sf.view(torch.float8_e4m3fn),
+                )
 
         use_dcp = self.dcp_world_size > 1
 
@@ -2101,20 +2080,18 @@ class FlashInferImpl(AttentionImpl):
                 layer._k_scale,
                 layer._v_scale,
             )
-            if self.use_fa2_nvfp4_kv:
-                # Task A: scatter the just-written tokens' block-scales into the
-                # persistent per-layer fa2-SF cache (K linear, V de-swizzled),
-                # only for the new slots (O(new tokens)).
-                self._fa2_update_sf_cache(kv_cache, slot_mapping)
-                if _NVFP4_DBG and not getattr(self, "_fa2_upd_dbg", False):
-                    self._fa2_upd_dbg = True
-                    logger.info(
-                        "NVFP4DBG upd layer=%s slots=%d valid=%d cache=%s",
-                        getattr(layer, "layer_name", "?"),
-                        slot_mapping.shape[0],
-                        int((slot_mapping >= 0).sum()),
-                        "set" if self._fa2_sf_cache is not None else "None",
-                    )
+            # B2: no post-write de-swizzle. reshape_and_cache_flash already stored V-SF
+            # trtllm-swizzled in the interleaved cache; the fa2 kernel de-swizzles it in
+            # place on read (page_produce_kv_sf<true>). So there is NO persistent contiguous
+            # V-SF cache (saves the old +5.5% pool) and NO Triton fill here.
+            if self.use_fa2_nvfp4_kv and _NVFP4_DBG and not getattr(self, "_fa2_upd_dbg", False):
+                self._fa2_upd_dbg = True
+                logger.info(
+                    "NVFP4DBG upd layer=%s slots=%d valid=%d B2(no V-SF cache)",
+                    getattr(layer, "layer_name", "?"),
+                    slot_mapping.shape[0],
+                    int((slot_mapping >= 0).sum()),
+                )
 
     def _ensure_fa2_sf_cache(self, v_sf: torch.Tensor) -> torch.Tensor:
         # (Re)allocate the persistent CONTIGUOUS V-SF cache if absent or if the pool

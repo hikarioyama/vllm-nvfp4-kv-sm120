@@ -494,27 +494,52 @@ __device__ __forceinline__ void page_produce_kv_sf(
     // For k < NUM_SF_ITERS-1, (flat_byte < SF_TOTAL_BYTES) is always true (optimized away).
     const bool in_bounds = (flat_byte < SF_TOTAL_BYTES) && (kv_idx_base + sf_smem_row < kv_len);
 
-    // SF strides are passed explicitly (sf_stride_*), so K can be read directly from the
-    // interleaved cache view and V from a contiguous de-swizzled cache (no data/8 over-alloc).
+    // SF strides are passed explicitly (sf_stride_*). K is read directly from the interleaved
+    // cache view (linear). V (B2) is read directly from the IN-PLACE swizzled V-SF cache view
+    // and de-swizzled per element here — no separate +5.5% contiguous de-swizzle cache.
     // packed_kv_bound guards indices[] access; returns offset 0 for out-of-range rows.
     uint32_t page_iter, entry_idx;
     const uint32_t packed_block_iter = packed_page_iter_base + sf_smem_row;
     page_size.divmod(packed_block_iter, page_iter, entry_idx);
-    const size_t sf_gmem_offset =
+    const size_t page_head_base =
         static_cast<size_t>(packed_block_iter < packed_kv_bound ? indices[page_iter] : 0) *
             sf_stride_page +
-        kv_head_idx * sf_stride_h + entry_idx * sf_stride_n +
-        sf_smem_col;
+        kv_head_idx * sf_stride_h;
 
-    // V SF must zero-fill out-of-bounds entries: compute_sfm_v reads SF for all CTA_TILE_KV rows
-    // including padding, and 0 (softmax weight) * NaN (uninitialized SF) = NaN (IEEE 754).
-    // K SF can use kNoFill since NaN K scores are replaced by -inf via logits_mask before
-    // update_mdo_states, so they never reach the accumulator.
-    constexpr auto fill_mode =
-        produce_v ? cp_async::SharedMemFillMode::kFillZero : cp_async::SharedMemFillMode::kNoFill;
-    cp_async::pred_load_32b<fill_mode>(reinterpret_cast<uint32_t*>(sf_smem + flat_byte),
-                                       reinterpret_cast<const uint32_t*>(sf_ptr + sf_gmem_offset),
-                                       in_bounds);
+    if constexpr (produce_v) {
+      // B2 in-kernel V de-swizzle. The vLLM writer stores V-SF in the trtllm swizzle:
+      // stored is reshape(page//4, 4, sd//4, 4).permute so that linear (entry=t', col=d')
+      // maps to stored (swz_entry, swz_sd) with  (SF_GROUPS = SF_COLS/4 = sd//4)
+      //   swz_entry = (t'/4)*4 + (d' / SF_GROUPS)
+      //   swz_sd    = (d' % SF_GROUPS)*4 + (t' % 4)
+      // This 32-bit smem word covers 4 cols {sf_smem_col..+3} of ONE row (t'=entry_idx); the
+      // 4 source bytes are at irregular (swz_entry, swz_sd), so gather per byte then one 32-bit
+      // smem store. All 4 cols share the row, so the single per-row in_bounds predicate gives
+      // correct zero-fill of padding rows (compute_sfm_v needs 0, not NaN, for masked rows).
+      // Requires SF_COLS % 4 == 0 (HEAD_DIM_VO % 64 == 0); Step3.7 HEAD_DIM_VO=128 -> SF_COLS=8.
+      uint32_t packed = 0;
+      if (in_bounds) {
+        constexpr uint32_t SF_GROUPS = SF_COLS / 4;  // sd // 4
+        const uint32_t a4 = entry_idx & ~3u;         // (t'/4)*4
+        const uint32_t e = entry_idx & 3u;           // t' % 4
+        uint8_t* pb = reinterpret_cast<uint8_t*>(&packed);
+#pragma unroll
+        for (uint32_t j = 0; j < 4; ++j) {
+          const uint32_t dcol = sf_smem_col + j;            // linear sd col d'
+          const uint32_t swz_entry = a4 + dcol / SF_GROUPS;
+          const uint32_t swz_sd = (dcol % SF_GROUPS) * 4 + e;
+          pb[j] = sf_ptr[page_head_base + static_cast<size_t>(swz_entry) * sf_stride_n + swz_sd];
+        }
+      }
+      *reinterpret_cast<uint32_t*>(sf_smem + flat_byte) = packed;
+    } else {
+      // K SF: linear read via cp.async (kNoFill; NaN K scores become -inf via logits_mask
+      // before update_mdo_states, so out-of-range K SF never reaches the accumulator).
+      const size_t sf_gmem_offset = page_head_base + entry_idx * sf_stride_n + sf_smem_col;
+      cp_async::pred_load_32b<cp_async::SharedMemFillMode::kNoFill>(
+          reinterpret_cast<uint32_t*>(sf_smem + flat_byte),
+          reinterpret_cast<const uint32_t*>(sf_ptr + sf_gmem_offset), in_bounds);
+    }
   }
 }
 

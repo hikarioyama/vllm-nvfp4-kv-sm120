@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # run.sh — launch a patched vLLM image with NVFP4 KV on SM120.
 # Assumes you built the image with the Dockerfile (patches baked in). Persists the FlashInfer
-# JIT cache to the host so the explicit-stride kernel only compiles once.
+# JIT cache to the host so the FA2 NVFP4 kernel only compiles once.
 #
-#   MODEL_DIR=/path/to/model GPU_UTIL=0.88 IMAGE=vllm-nvfp4-kv-sm120 ./run.sh
+#   MODEL_DIR=/path/to/model GPU_UTIL=0.92 IMAGE=vllm-nvfp4-kv-sm120 ./run.sh
 set -uo pipefail
 
 IMAGE="${IMAGE:-vllm-nvfp4-kv-sm120}"
 MODEL_DIR="${MODEL_DIR:?set MODEL_DIR=/path/to/model}"
 SERVED="${SERVED:-model}"
 PORT="${PORT:-8000}"
-GPU_UTIL="${GPU_UTIL:-0.88}"          # see README: +5.5% SF cache is unaccounted; keep below fp8 util
+GPU_UTIL="${GPU_UTIL:-0.92}"          # B2: no SF over-alloc, util can match fp8 (see README)
 MAX_LEN="${MAX_LEN:-32768}"
 TP="${TP:-1}"
 NAME="${NAME:-vllm-nvfp4-kv-sm120}"

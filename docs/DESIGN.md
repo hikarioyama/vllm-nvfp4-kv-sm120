@@ -1,4 +1,4 @@
-# Design: NVFP4 KV cache on SM120 via FlashInfer FA2 + explicit SF strides
+# Design: NVFP4 KV cache on SM120 via FlashInfer FA2 (in-kernel V-SF de-swizzle)
 
 ## Background
 
@@ -20,85 +20,106 @@ arch-generic way: it dequantizes `e2m1`→bf16 in registers (`cvt.e2m1x2`, SM120
 path) and computes with standard Ampere `mma.sync` — no tcgen05/tmem/trtllm-gen. So the FA2 path
 works on SM120; the job is to feed it the scale factors correctly.
 
-## The three wiring problems (and how the base SM120 path solved them)
+## The three wiring problems
 
 vLLM stores the cache interleaved per page as `[K_data | K_scale | V_data | V_scale]`. Feeding FA2:
 
 1. **Per-tensor global scale** must be passed (`k_scale`/`v_scale` = `layer._{k,v}_scale_float`),
    else cos collapses.
-2. **V block-scale is 4-token swizzled** by the writer (trtllm-compatible) but FA2 reads it linearly
-   → V must be **de-swizzled**. K is stored linear.
+2. **V block-scale is 4-token swizzled** by the writer (trtllm-compatible); FA2's smem fill reads it
+   linearly → the swizzle has to be undone somewhere.
 3. **SF page-stride mismatch** — the FA2 kernel derived the SF gmem stride as
    `data_stride / SF_CONTAINERS` (SF_CONTAINERS = NVFP4_SF_VEC_SIZE/2 = 8) with **no independent SF
    stride input**. In the interleaved layout the SF view shares the *data* page stride, so
    `data_stride/8` mis-addresses the page term by 8× → multi-page garbage.
 
-The base SM120 path (before this patch) worked around #3 by repacking **both** K and V scales into a
-**sparse scratch** whose strides are exactly `(data_page//8, data_head, data_token, 1)`. That sparse
-block stride (`data_page/8`) is ~2.25× the real per-block SF size → **+25% of the KV pool**,
-unaccounted by vLLM's profiler, forcing a low `--gpu-memory-utilization` (~0.80). At that util the
-real token pool was roughly a *tie* with fp8 — the 1.78×/byte advantage was eaten by the util hit.
+### How the naïve SM100-style path failed on SM120
 
-## This patch: explicit SF strides
+The pre-patch path worked around #3 by repacking **both** K and V scales into a **sparse scratch**
+whose strides are exactly `(data_page//8, data_head, data_token, 1)`. That sparse block stride
+(`data_page/8`) is ~2.25× the real per-block SF size → **+25% of the KV pool**, unaccounted by
+vLLM's memory profiler, forcing a low `--gpu-memory-utilization` (~0.80). At that util the real
+token pool was roughly a *tie* with fp8 — the 1.78×/byte advantage was eaten by the util hit.
 
-Make the kernel take **explicit** `sf_stride_page/h/n` instead of deriving `data_stride/8`. Then:
+## The patch — explicit SF strides + in-kernel V de-swizzle
 
-- **K-SF**: pass the interleaved cache view's *own* strides → the kernel reads K **directly from the
-  cache** (K is linear). **Zero scratch.**
-- **V-SF**: keep a **contiguous** de-swizzled parallel cache (real size, no 2.25× over-alloc) and
-  pass its contiguous strides. **+5.5% of pool** (V only).
+Two layers, both shipped here:
 
-SF-cache overhead **+25% → +5.5%**, so util can rise back toward fp8's, and the real token pool
-exceeds fp8 (measured ~1.5× at a robust util).
+### Layer A — explicit SF strides (fixes #3, zero K scratch)
 
-### Why it's a small change
+Make the kernel take **explicit** `sf_stride_page/h/n` instead of deriving `data_stride/8`. Then
+**K-SF** is passed the interleaved cache view's *own* strides → the kernel reads K **directly from
+the cache** (K is stored linear). **Zero scratch for K.**
+
+### Layer B — in-kernel V-SF de-swizzle (fixes #2, zero V scratch)
+
+The V block-scale is stored **swizzled** in the interleaved cache (trtllm 4-token layout). Instead
+of de-swizzling it into a separate contiguous parallel cache (an earlier interim approach that cost
+**+5.5%** of the KV pool, "B1"), the kernel reads the swizzled V-SF **in place** from the cache view
+and applies the inverse 4-token swizzle to the gmem offset **per element, in registers**. So V-SF
+needs **zero scratch** too.
+
+**Net: +0% SF over-allocation for both K and V.** No persistent SF cache, nothing hidden from the
+memory profiler, so `--gpu-memory-utilization` can sit right where fp8 runs and the **full ~1.78×
+byte ceiling is realized as real tokens** (≈1.79× measured vs fp8 at matched util). This is the
+"B2" design; it supersedes the +5.5% V-SF cache.
+
+### Why the binding stays small
 
 `maybe_k_cache_sf` / `maybe_v_cache_sf` are FlashInfer **additional tensors** — they arrive at the
-binding as `TensorView`s, which carry `.stride()`. So we don't need new wrapper args, jinja edits, or
-binding edits: the codegen helper `generate_additional_params` auto-emits `<name>_stride_page/h/n`
-Params fields and a **layout-aware setter** (`page=stride(0)`, and `n`/`h` per `QKVLayout`, read from
-the int64 `layout` arg already in scope). The kernel reads `params.maybe_{k,v}_cache_sf_stride_*` and
-passes K-strides to K-producer calls, V-strides to V-producer calls.
+binding as `TensorView`s carrying `.stride()`. The codegen helper `generate_additional_params`
+auto-emits `<name>_stride_page/h/n` Params fields and a **layout-aware setter** (`page=stride(0)`,
+`n`/`h` per `QKVLayout`, read from the int64 `layout` arg already in scope). The kernel reads
+`params.maybe_{k,v}_cache_sf_stride_*`, passes K-strides to K-producer calls and V-strides to
+V-producer calls, and (B2) computes the de-swizzled V-SF offset inline — so no new wrapper args,
+jinja edits, or binding signature changes are needed for the symmetric path.
 
-### Files
+### Files (symmetric NVFP4 path)
 
 | file | change |
 |---|---|
-| `flashinfer/data/include/flashinfer/attention/prefill.cuh` | `page_produce_kv_sf` / `produce_kv_sf` take explicit `sf_stride_page/h/n`; 3 kernels (single/ragged/paged) read `params.maybe_{k,v}_cache_sf_stride_*` and split K/V strides across all 12 call sites |
+| `flashinfer/data/include/flashinfer/attention/prefill.cuh` | `page_produce_kv_sf` / `produce_kv_sf` take explicit `sf_stride_page/h/n`; V-SF read in place + **in-kernel 4-token de-swizzle**; 3 kernels (single/ragged/paged) split K/V strides across all call sites |
 | `flashinfer/jit/attention/utils.py` | `generate_additional_params` auto-emits stride fields + layout-aware setter for the `maybe_{k,v}_cache_sf` tensors |
-| `vllm/v1/attention/backends/flashinfer.py` | SM120 FA2 NVFP4-KV backend: K direct (interleaved view), V de-swizzled into a persistent **contiguous** per-layer cache via a graph-safe Triton fill (`_nvfp4_v_sf_fill_kernel`, separate src/dst strides), incremental (O(new tokens)); fallback = K direct + dynamic contiguous V scratch |
+| `vllm/v1/attention/backends/flashinfer.py` | SM120 FA2 NVFP4-KV backend: K and V-SF both read directly from the interleaved cache view (no parallel scratch); SM120 gate `_use_fa2_for_nvfp4_kv_on_sm120()` |
+
+The three are also provided as reference unified diffs in [`patches/`](../patches/) (regenerated
+against the pinned versions; `apply_patches.sh` installs the full files from `src/`).
+
+## Independent K/V precision (K=fp8 / V=nvfp4) — validated, serving wiring is follow-up
+
+The kernel's `DTypeKV` template parameter is split into independent `DTypeK` / `DTypeV` (trailing
+defaults `DTypeK_=DTypeKV_, DTypeV_=DTypeKV_`, so `dtype_k==dtype_v` is **bit-identical** to before).
+With `K=fp8` the SF path is `compile-time` skipped via `is_fp4_type_v<DTypeK>` (fp8 carries no block
+scale — only the per-tensor scale), while `V=nvfp4` still loads + in-kernel de-swizzles its V-SF.
+This lets you spend bytes where precision matters more (K) and compress V.
+
+Integration is complete across four layers and **numerically validated** (`harness/h_layout_mixed.py`,
+cos 0.99513 NHD & HND; symmetric regression `h_layout_b2.py` cos 0.99499 intact):
+1. kernel split (`prefill.cuh` / `page.cuh` independent V stride),
+2. wrapper API (`plan(dtype_k=, dtype_v=)`, `run(kv_cache_sf=(None, v_sf))`),
+3. JIT module URI (`_mixk_*_mixv_*` suffix so mixed kernels cache separately),
+4. FFI arg binding (both SF slots passed, `None` for the non-fp4 side).
+
+What is **not** yet wired is the vLLM **serving** forward path (selecting the mixed dtype via a flag
+and feeding the split cache views through `plan()/run()` at request time). See
+[`KV_QUALITY_STUDY.md`](KV_QUALITY_STUDY.md) for the remaining steps and the measured headroom (the
+6-config study shows symmetric NVFP4 KV is already near-lossless, so mixed's expected upside is the
++0.01–0.02 nats PPL gap — small, hence deferred).
 
 ## CUDA-graph + MTP
 
-The V-SF cache is filled incrementally at `do_kv_cache_update` time (only the new tokens, fixed-grid
-Triton kernel keyed on `slot_mapping`), so `forward()` just reads fixed tensors → no dynamic-shape
-repack → FULL_AND_PIECEWISE capture works. MTP (spec decode) needs no backend change
+With B2 there is no incremental SF-cache fill at all — both K-SF and V-SF are read straight from the
+fixed interleaved cache during `forward()`, so there is no dynamic-shape repack and
+`FULL_AND_PIECEWISE` CUDA-graph capture works. MTP (spec decode) needs no backend change
 (`supports_spec_as_decode` stays False; the K-step verify goes through the FA2 prefill path; the
 draft 1-token decode is captured).
 
-## The util caveat (operational)
-
-The +5.5% V-SF cache is allocated lazily during the first real forward and is **not** counted by
-vLLM's memory profiler. So util slightly below fp8's is required, or the first request OOMs. Sweep
-down from your fp8 util:
-
-| util (this setup) | pool | note |
-|---|---|---|
-| 0.90 | ~2.71M | OOM at inference (runtime headroom too thin) |
-| 0.88 | ~2.47M | robust, ~1.5× fp8 (recommended) |
-| 0.87 | ~2.34M | extra margin |
-
-A future improvement ("B2") removes the V cache entirely by applying the 4-token swizzle to the V-SF
-gmem offset **inside** the kernel (read swizzled V directly) → +0% overhead → util can match fp8 →
-full 1.78× ceiling. Not implemented here (the vectorized SF load + per-element swizzle is fiddly).
-
 ## Verification
 
-`harness/h_layout_explicit.py` writes a real cache via `reshape_and_cache_flash`, passes the K view
-+ contiguous V cache through the FA2 wrapper with explicit strides, and checks:
-- attention output **cos vs an fp32 reference** (≈0.995 = NVFP4 quant error),
-- **byte-exact** V de-swizzle vs a full-tensor reference,
-- both **NHD and HND** layouts.
-
-Because K is read from a view whose strides would be mis-read under the old `data/8` derivation, a
-PASS proves the explicit-stride kernel actually compiled and ran.
+`harness/h_layout_b2.py` writes a real cache via `reshape_and_cache_flash`, passes the K view + the
+**in-place swizzled** V-SF view through the FA2 wrapper with explicit strides, and checks the
+attention output **cos vs an fp32 reference** (≈0.995 = NVFP4 quant error) for both **NHD and HND**.
+A PASS proves the explicit-stride kernel and the in-kernel de-swizzle compiled and ran correctly
+(K is read from a view whose strides would be mis-read under the old `data/8` derivation).
+`harness/h_layout_mixed.py` does the same for K=fp8 / V=nvfp4. The earlier `h_layout_explicit.py`
+(B1, contiguous V-SF cache) is kept for historical comparison.

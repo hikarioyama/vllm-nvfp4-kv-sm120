@@ -1,0 +1,35 @@
+
+########## KV=fp8 util=0.92 MTP=1 ##########
+→ launching step3p7 KV=fp8(flag=fp8) MTP=1 util=0.92 max-len=131072
+→ READY: KV=fp8 MTP=1 / GPU KV cache size: 1,663,988 tokens / Maximum concurrency for 131,072 tokens per request: 12.70x ✓
+   http://127.0.0.1:8002/v1  (util 0.92, max_model_len 131072)
+--- decode speed (single + conc 1,2,4 aggregate, MTP=1) ---
+conc=1: 114.59 tok/s aggregate
+conc=2: 170.48 tok/s aggregate
+conc=4: 347.37 tok/s aggregate
+saved step37_cap_fp8_0.92_mtp1.bench.json
+
+########## KV=nvfp4 util=0.92 MTP=1 ##########
+→ launching step3p7 KV=nvfp4(flag=nvfp4) MTP=1 util=0.92 max-len=131072
+   patched sources: /home/hikari/bench/step37  (JIT recompile first run ~5-10min)
+→ READY: KV=nvfp4 MTP=1 / GPU KV cache size: 2,960,263 tokens / Maximum concurrency for 131,072 tokens per request: 22.59x ✓
+   http://127.0.0.1:8002/v1  (util 0.92, max_model_len 131072)
+--- decode speed (single + conc 1,2,4 aggregate, MTP=1) ---
+conc=1: 111.80 tok/s aggregate
+conc=2: 171.24 tok/s aggregate
+conc=4: 316.89 tok/s aggregate
+saved step37_cap_nvfp4_0.92_mtp1.bench.json
+
+########## KV=nvfp4 util=0.93 MTP=1 ##########
+→ launching step3p7 KV=nvfp4(flag=nvfp4) MTP=1 util=0.93 max-len=131072
+   patched sources: /home/hikari/bench/step37  (JIT recompile first run ~5-10min)
+→ READY: KV=nvfp4 MTP=1 / GPU KV cache size: 3,083,173 tokens / Maximum concurrency for 131,072 tokens per request: 23.52x ✓
+   http://127.0.0.1:8002/v1  (util 0.93, max_model_len 131072)
+--- decode speed (single + conc 1,2,4 aggregate, MTP=1) ---
+conc=1: 121.20 tok/s aggregate
+conc=2: 175.01 tok/s aggregate
+conc=4: 372.26 tok/s aggregate
+saved step37_cap_nvfp4_0.93_mtp1.bench.json
+
+########## DONE (MTP=1) ##########
+summary (KV pool tokens @ util):

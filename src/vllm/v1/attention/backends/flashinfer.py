@@ -89,6 +89,91 @@ logger = init_logger(__name__)
 # One-shot debug for the SM120 fa2 NVFP4 SF cache (set VLLM_NVFP4_DEBUG=1).
 _NVFP4_DBG = bool(os.environ.get("VLLM_NVFP4_DEBUG"))
 
+
+def _normalize_kv_cache_dtype_name(dtype: str | torch.dtype) -> str:
+    if isinstance(dtype, torch.dtype):
+        if dtype == torch.float8_e4m3fn:
+            return "fp8_e4m3"
+        if dtype == torch.float8_e5m2:
+            return "fp8_e5m2"
+        if dtype == torch.uint8:
+            return "nvfp4"
+        return str(dtype).replace("torch.", "")
+    return str(dtype).lower()
+
+
+def _split_kv_cache_dtypes(
+    cache_dtype: str | torch.dtype,
+) -> tuple[str | torch.dtype, str | torch.dtype]:
+    name = _normalize_kv_cache_dtype_name(cache_dtype)
+    if name in ("mixed_fp8_nvfp4", "fp8_nvfp4", "fp8_e4m3_nvfp4"):
+        return "fp8_e4m3", "nvfp4"
+    for sep in ("+", ":", ",", "/"):
+        if sep in name:
+            k_name, v_name = [part.strip() for part in name.split(sep, 1)]
+            return k_name, v_name
+    return cache_dtype, cache_dtype
+
+
+def _is_nvfp4_cache_dtype(dtype: str | torch.dtype) -> bool:
+    return _normalize_kv_cache_dtype_name(dtype) == "nvfp4"
+
+
+def _is_mixed_kv_cache_dtype(cache_dtype: str | torch.dtype) -> bool:
+    dtype_k, dtype_v = _split_kv_cache_dtypes(cache_dtype)
+    return _normalize_kv_cache_dtype_name(dtype_k) != _normalize_kv_cache_dtype_name(dtype_v)
+
+
+def _mixed_kv_cache_shapes(
+    num_blocks: int,
+    block_size: int,
+    num_kv_heads: int,
+    head_size: int,
+    dtype_k: str | torch.dtype,
+    dtype_v: str | torch.dtype,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    def side_last_dim(dtype: str | torch.dtype) -> int:
+        return nvfp4_kv_cache_full_dim(head_size) if _is_nvfp4_cache_dtype(dtype) else head_size
+
+    return (
+        (num_blocks, block_size, num_kv_heads, side_last_dim(dtype_k)),
+        (num_blocks, block_size, num_kv_heads, side_last_dim(dtype_v)),
+    )
+
+
+def _split_mixed_kv_cache_views(
+    kv_cache: tuple[torch.Tensor, torch.Tensor],
+    stride_order: tuple[int, ...],
+    dtype_k: str | torch.dtype,
+    dtype_v: str | torch.dtype,
+) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor | None, torch.Tensor | None]]:
+    # REVIEW(mixed): K/V tensors are separate only when dtype_k != dtype_v; symmetric cache
+    # layout stays the existing unified tensor path.
+    k_cache, v_cache = kv_cache
+    side_stride_order = tuple(dim - 1 for dim in stride_order if dim != 1)
+    k_cache = canonicalize_singleton_dim_strides(k_cache.permute(*side_stride_order))
+    v_cache = canonicalize_singleton_dim_strides(v_cache.permute(*side_stride_order))
+    k_sf = None
+    v_sf = None
+    if _is_nvfp4_cache_dtype(dtype_k):
+        (k_cache,), (k_sf,) = nvfp4_kv_cache_split_views(k_cache)
+    if _is_nvfp4_cache_dtype(dtype_v):
+        (v_cache,), (v_sf,) = nvfp4_kv_cache_split_views(v_cache)
+    return (k_cache, v_cache), (k_sf, v_sf)
+
+
+def _mixed_writer_scratch(
+    owner: object,
+    name: str,
+    like: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    scratch = getattr(owner, name, None)
+    if scratch is None or scratch.shape != like.shape or scratch.device != like.device:
+        scratch = torch.empty(like.shape, dtype=dtype, device=like.device)
+        setattr(owner, name, scratch)
+    return scratch
+
 trtllm_gen_workspace_buffer = None
 
 
@@ -501,7 +586,14 @@ class FlashInferBackend(AttentionBackend):
         num_kv_heads: int,
         head_size: int,
         cache_dtype_str: str = "auto",
-    ) -> tuple[int, ...]:
+    ) -> tuple[int, ...] | tuple[tuple[int, ...], tuple[int, ...]]:
+        dtype_k, dtype_v = _split_kv_cache_dtypes(cache_dtype_str)
+        if _normalize_kv_cache_dtype_name(dtype_k) != _normalize_kv_cache_dtype_name(dtype_v):
+            # REVIEW(mixed): mixed K/V precision cannot use the legacy unified
+            # [num_blocks, 2, ...] tensor because K and V last_dim differ.
+            return _mixed_kv_cache_shapes(
+                num_blocks, block_size, num_kv_heads, head_size, dtype_k, dtype_v
+            )
         if cache_dtype_str == "nvfp4":
             # Packed layout: fp4 data + fp8 block scales in last dim
             last_dim = nvfp4_kv_cache_full_dim(head_size)
@@ -760,6 +852,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
         if self.kv_cache_spec.kv_quant_mode != KVQuantMode.NONE:
             self.cache_dtype = self.cache_config.cache_dtype
+            self.cache_dtype_k, self.cache_dtype_v = _split_kv_cache_dtypes(
+                self.cache_dtype
+            )
+            self.is_kvcache_mixed = _normalize_kv_cache_dtype_name(
+                self.cache_dtype_k
+            ) != _normalize_kv_cache_dtype_name(self.cache_dtype_v)
             # Cannot use self.kv_cache_spec.dtype here because kv_cache_spec
             # storage dtype may not be the same as the op dtype (uint8 vs fp8_e4m3)
             self.is_kvcache_nvfp4 = self.cache_dtype == "nvfp4"
@@ -767,12 +865,21 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 # For NVFP4, kv_cache_dtype stays as the string "nvfp4"
                 # which is passed to FlashInferImpl
                 self.kv_cache_dtype = self.cache_dtype
+            elif self.is_kvcache_mixed:
+                # REVIEW(mixed): wrapper planning still exposes one kv_data_type;
+                # use K's dtype while V travels via the tuple cache + V-SF path.
+                self.kv_cache_dtype = FlashInferBackend.get_dtype_for_flashinfer(
+                    self.cache_dtype_k
+                )
             else:
                 self.kv_cache_dtype = FlashInferBackend.get_dtype_for_flashinfer(
                     self.cache_dtype
                 )
         else:
             self.cache_dtype = "auto"
+            self.cache_dtype_k = self.cache_dtype
+            self.cache_dtype_v = self.cache_dtype
+            self.is_kvcache_mixed = False
             self.is_kvcache_nvfp4 = False
             assert self.kv_cache_spec.dtype == self.model_config.dtype
             self.kv_cache_dtype = self.kv_cache_spec.dtype
@@ -785,6 +892,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.use_fa2_nvfp4_kv = (
             self.is_kvcache_nvfp4 and _use_fa2_for_nvfp4_kv_on_sm120()
         )
+        self.use_fa2_mixed_kv = (
+            self.is_kvcache_mixed
+            and _normalize_kv_cache_dtype_name(self.cache_dtype_k)
+            in ("fp8", "fp8_e4m3")
+            and _is_nvfp4_cache_dtype(self.cache_dtype_v)
+            and _use_fa2_for_nvfp4_kv_on_sm120()
+        )
 
         if (
             can_use_trtllm
@@ -795,7 +909,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 self.q_data_type = FlashInferBackend.get_dtype_for_flashinfer(
                     "fp8_e4m3"
                 )
-            elif self.use_fa2_nvfp4_kv:
+            elif self.use_fa2_nvfp4_kv or self.use_fa2_mixed_kv:
                 self.q_data_type = self.model_config.dtype
             else:
                 self.q_data_type = self.kv_cache_dtype
@@ -805,7 +919,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # Prefer TRTLLM attention for decoding in all cases.
         # This allows us to use AttentionCGSupport.UNIFORM_BATCH mode.
         self.use_trtllm_decode_attention = (
-            can_use_trtllm and not self.use_fa2_nvfp4_kv
+            can_use_trtllm and not self.use_fa2_nvfp4_kv and not self.use_fa2_mixed_kv
         )
         self._init_reorder_batch_threshold(
             1, supports_spec_as_decode=self.use_trtllm_decode_attention
@@ -1332,6 +1446,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         if self.use_fa2_nvfp4_kv
                         else self.kv_cache_dtype
                     )
+                    if self.use_fa2_mixed_kv:
+                        kv_data_type = self.kv_cache_dtype
                     prefill_wrapper.plan(
                         qo_indptr=qo_indptr_prefill_cpu,
                         paged_kv_indptr=paged_kv_indptr_prefill_cpu,
@@ -1391,6 +1507,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     if self.use_fa2_nvfp4_kv
                     else self.kv_cache_dtype
                 )
+                if self.use_fa2_mixed_kv:
+                    kv_data_type = self.kv_cache_dtype
                 fast_plan_decode(
                     decode_wrapper,
                     indptr_cpu=self.paged_kv_indptr.cpu[: num_input_tokens + 1],
@@ -1417,6 +1535,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         return attn_metadata
 
     def use_cascade_attention(self, *args, **kwargs) -> bool:
+        if getattr(self, "is_kvcache_mixed", False):
+            return False
         if self.kv_cache_spec.dtype != self.vllm_config.model_config.dtype:
             # TODO: The cascade wrapper currently does not support setting
             # kv cache dtype to something different from query dtype.
@@ -1457,10 +1577,33 @@ class FlashInferImpl(AttentionImpl):
         self.window_left = (
             self.sliding_window[0] if self.sliding_window is not None else -1
         )
+        vllm_config = get_current_vllm_config_or_none()
+        configured_cache_dtype = (
+            getattr(vllm_config.cache_config, "cache_dtype", None)
+            if vllm_config is not None
+            else None
+        )
+        if configured_cache_dtype is not None and _is_mixed_kv_cache_dtype(
+            configured_cache_dtype
+        ):
+            kv_cache_dtype = configured_cache_dtype
         self.kv_cache_dtype = kv_cache_dtype
+        self.kv_cache_dtype_k, self.kv_cache_dtype_v = _split_kv_cache_dtypes(
+            kv_cache_dtype
+        )
+        self.is_kvcache_mixed = _normalize_kv_cache_dtype_name(
+            self.kv_cache_dtype_k
+        ) != _normalize_kv_cache_dtype_name(self.kv_cache_dtype_v)
         self.is_kvcache_nvfp4 = kv_cache_dtype == "nvfp4"
         self.use_fa2_nvfp4_kv = (
             self.is_kvcache_nvfp4 and _use_fa2_for_nvfp4_kv_on_sm120()
+        )
+        self.use_fa2_mixed_kv = (
+            self.is_kvcache_mixed
+            and _normalize_kv_cache_dtype_name(self.kv_cache_dtype_k)
+            in ("fp8", "fp8_e4m3")
+            and _is_nvfp4_cache_dtype(self.kv_cache_dtype_v)
+            and _use_fa2_for_nvfp4_kv_on_sm120()
         )
         # Persistent per-layer fa2 V-SF cache (Task A+B): CONTIGUOUS de-swizzled V
         # block-scales (+5.5% pool). K needs no cache — the explicit-SF-stride kernel
@@ -1469,7 +1612,11 @@ class FlashInferImpl(AttentionImpl):
         # /step AND CUDA-graph capturable (Task B).
         self._fa2_sf_cache: torch.Tensor | None = None
         self._fa2_v_deswz_table: torch.Tensor | None = None
-        self.fp4_data_dim = head_size // 2 if self.is_kvcache_nvfp4 else 0
+        self.fp4_data_dim = (
+            head_size // 2
+            if self.is_kvcache_nvfp4 or _is_nvfp4_cache_dtype(self.kv_cache_dtype_v)
+            else 0
+        )
         self.logits_soft_cap = logits_soft_cap
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
 
@@ -1494,12 +1641,12 @@ class FlashInferImpl(AttentionImpl):
             self.sinks = sinks
 
         self.support_trtllm_attn = can_use_trtllm_attention(num_heads, num_kv_heads)
-        vllm_config = get_current_vllm_config_or_none()
         self.supports_quant_query_input = (
             self.support_trtllm_attn
             and vllm_config is not None
             and not vllm_config.attention_config.disable_flashinfer_q_quantization
             and not self.use_fa2_nvfp4_kv
+            and not self.use_fa2_mixed_kv
         )
         self.bmm1_scale: float | None = None
         self.bmm2_scale: float | None = None
@@ -1510,6 +1657,7 @@ class FlashInferImpl(AttentionImpl):
         if (
             self.is_kvcache_nvfp4
             and not self.use_fa2_nvfp4_kv
+            and not self.use_fa2_mixed_kv
             and vllm_config is not None
         ):
             max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
@@ -1535,6 +1683,7 @@ class FlashInferImpl(AttentionImpl):
         return (
             self.support_trtllm_attn
             and not self.use_fa2_nvfp4_kv
+            and not self.use_fa2_mixed_kv
             and is_quantized_kv_cache(self.kv_cache_dtype)
             and quant_key in (kFp8StaticTensorSym, kNvfp4Dynamic)
         )
@@ -1581,12 +1730,12 @@ class FlashInferImpl(AttentionImpl):
 
         if self.bmm1_scale is None:
             self.bmm1_scale = self.scale
-            if is_quantized_kv_cache(self.kv_cache_dtype):
+            if is_quantized_kv_cache(self.kv_cache_dtype) or self.is_kvcache_mixed:
                 self.bmm1_scale *= layer._q_scale_float * layer._k_scale_float
 
         if self.bmm2_scale is None:
             self.bmm2_scale = 1.0
-            if is_quantized_kv_cache(self.kv_cache_dtype):
+            if is_quantized_kv_cache(self.kv_cache_dtype) or self.is_kvcache_mixed:
                 self.bmm2_scale *= layer._v_scale_float
 
         prefill_use_trtllm = isinstance(attn_metadata.prefill, TRTLLMPrefill)
@@ -1639,7 +1788,11 @@ class FlashInferImpl(AttentionImpl):
 
         # FlashInfer treats uint8 KV cache as NVFP4. vLLM stores FP8 KV cache
         # as uint8 bytes, so pass FP8 caches with their logical dtype.
-        if not self.is_kvcache_nvfp4 and kv_cache.dtype == torch.uint8:
+        if (
+            not self.is_kvcache_nvfp4
+            and not self.is_kvcache_mixed
+            and kv_cache.dtype == torch.uint8
+        ):
             fp8_view_dtype = None
             if self.kv_cache_dtype in ("fp8", "fp8_e4m3", torch.float8_e4m3fn):
                 fp8_view_dtype = torch.float8_e4m3fn
@@ -1667,14 +1820,49 @@ class FlashInferImpl(AttentionImpl):
         num_prefill_tokens = attn_metadata.num_prefill_tokens
 
         stride_order = FlashInferBackend.get_kv_cache_stride_order()
-        kv_cache_permute = kv_cache.permute(*stride_order)  # HND and contiguous
+        mixed_kv_cache_sf = None
+        if self.is_kvcache_mixed:
+            assert isinstance(kv_cache, tuple), (
+                "mixed K/V cache dtype requires kv_cache=(k_cache, v_cache)"
+            )
+            (mixed_kv_cache, mixed_kv_cache_sf) = _split_mixed_kv_cache_views(
+                kv_cache, stride_order, self.kv_cache_dtype_k, self.kv_cache_dtype_v
+            )
+            kv_cache_permute = mixed_kv_cache
+            if _normalize_kv_cache_dtype_name(self.kv_cache_dtype_k) in (
+                "fp8",
+                "fp8_e4m3",
+            ) and kv_cache_permute[0].dtype == torch.uint8:
+                kv_cache_permute = (
+                    kv_cache_permute[0].view(torch.float8_e4m3fn),
+                    kv_cache_permute[1],
+                )
+            # REVIEW(mixed): K=fp8 has no SF tensor; V=nvfp4 keeps the B2 swizzled V-SF view.
+            mixed_kv_cache_sf = (
+                None
+                if mixed_kv_cache_sf[0] is None
+                else mixed_kv_cache_sf[0].view(torch.float8_e4m3fn),
+                None
+                if mixed_kv_cache_sf[1] is None
+                else mixed_kv_cache_sf[1].view(torch.float8_e4m3fn),
+            )
+            if mixed_kv_cache_sf[0] is None and mixed_kv_cache_sf[1] is not None:
+                # The mixed JIT variant filters K-SF out; this alias only keeps
+                # older tuple-unpack helpers from rejecting a None tensor.
+                mixed_kv_cache_sf = (mixed_kv_cache_sf[1], mixed_kv_cache_sf[1])
+        else:
+            kv_cache_permute = kv_cache.permute(*stride_order)  # HND and contiguous
         # Fix degenerate strides on any size-1 dimension (e.g. num_kv_heads=1
         # with TP=8).  PyTorch permits non-canonical strides on size-1 dims;
         # CUDA TMA requires ≥16-byte alignment on all non-outermost strides.
         # canonicalize_singleton_dim_strides patches metadata via as_strided —
         # zero-copy.  See vllm.utils.torch_utils.
-        fixed = canonicalize_singleton_dim_strides(kv_cache_permute)
-        if fixed is not kv_cache_permute:
+        fixed = (
+            kv_cache_permute
+            if self.is_kvcache_mixed
+            else canonicalize_singleton_dim_strides(kv_cache_permute)
+        )
+        if not self.is_kvcache_mixed and fixed is not kv_cache_permute:
             logger.debug(
                 "Canonicalized degenerate KV cache strides (FlashInfer): "
                 "shape=%s, strides before=%s, strides after=%s",
@@ -1688,7 +1876,10 @@ class FlashInferImpl(AttentionImpl):
         # Split into correctly-strided data and scale views.
         nvfp4_kv_data = None
         nvfp4_kv_block_scales = None
-        if self.is_kvcache_nvfp4:
+        if self.is_kvcache_mixed:
+            nvfp4_kv_data = kv_cache_permute
+            nvfp4_kv_block_scales = mixed_kv_cache_sf
+        elif self.is_kvcache_nvfp4:
             nvfp4_kv_data, nvfp4_kv_block_scales = nvfp4_kv_cache_split_views(
                 kv_cache_permute
             )
@@ -1760,10 +1951,12 @@ class FlashInferImpl(AttentionImpl):
                     assert prefill_wrapper._sm_scale == self.scale
                     assert prefill_wrapper._causal
 
-                    if self.is_kvcache_nvfp4:
+                    if self.is_kvcache_nvfp4 or self.is_kvcache_mixed:
                         kv_cache_permute = nvfp4_kv_data
                     kv_cache_sf = (
-                        nvfp4_kv_block_scales if self.is_kvcache_nvfp4 else None
+                        nvfp4_kv_block_scales
+                        if (self.is_kvcache_nvfp4 or self.is_kvcache_mixed)
+                        else None
                     )
 
                     needs_fp8_out_prefill = (
@@ -1781,7 +1974,7 @@ class FlashInferImpl(AttentionImpl):
                         kv_cache_permute,
                         q_scale=(
                             None
-                            if self.use_fa2_nvfp4_kv
+                            if self.use_fa2_nvfp4_kv or self.use_fa2_mixed_kv
                             else layer._q_scale_float
                         ),
                         k_scale=layer._k_scale_float,
@@ -1912,9 +2105,13 @@ class FlashInferImpl(AttentionImpl):
                 assert decode_wrapper._logits_soft_cap == (self.logits_soft_cap or 0.0)
                 assert decode_wrapper._sm_scale == self.scale
 
-                if self.is_kvcache_nvfp4:
+                if self.is_kvcache_nvfp4 or self.is_kvcache_mixed:
                     kv_cache_permute = nvfp4_kv_data
-                kv_cache_sf = nvfp4_kv_block_scales if self.is_kvcache_nvfp4 else None
+                kv_cache_sf = (
+                    nvfp4_kv_block_scales
+                    if (self.is_kvcache_nvfp4 or self.is_kvcache_mixed)
+                    else None
+                )
 
                 needs_fp8_out = (
                     self.is_kvcache_nvfp4
@@ -1941,7 +2138,7 @@ class FlashInferImpl(AttentionImpl):
                         kv_cache_permute,
                         q_scale=(
                             None
-                            if self.use_fa2_nvfp4_kv
+                            if self.use_fa2_nvfp4_kv or self.use_fa2_mixed_kv
                             else layer._q_scale_float
                         ),
                         k_scale=layer._k_scale_float,
@@ -1962,7 +2159,7 @@ class FlashInferImpl(AttentionImpl):
                         kv_cache_permute,
                         q_scale=(
                             None
-                            if self.use_fa2_nvfp4_kv
+                            if self.use_fa2_nvfp4_kv or self.use_fa2_mixed_kv
                             else layer._q_scale_float
                         ),
                         k_scale=layer._k_scale_float,
@@ -2068,6 +2265,40 @@ class FlashInferImpl(AttentionImpl):
             # and value[:num_actual_tokens] because the reshape_and_cache_flash
             # op uses the slot_mapping's shape to determine the number of
             # actual tokens.
+            if self.is_kvcache_mixed:
+                assert isinstance(kv_cache, tuple), (
+                    "mixed K/V cache dtype requires kv_cache=(k_cache, v_cache)"
+                )
+                k_cache, v_cache = kv_cache
+                # REVIEW(mixed): existing writer op has one dtype argument, so
+                # mixed K=fp8/V=nvfp4 is materialized by two side-effect calls.
+                scratch_v = _mixed_writer_scratch(
+                    self, "_mixed_writer_fp8_v_scratch", k_cache, k_cache.dtype
+                )
+                torch.ops._C_cache_ops.reshape_and_cache_flash(
+                    key,
+                    value,
+                    k_cache,
+                    scratch_v,
+                    slot_mapping,
+                    self.kv_cache_dtype_k,
+                    layer._k_scale,
+                    layer._v_scale,
+                )
+                scratch_k = _mixed_writer_scratch(
+                    self, "_mixed_writer_nvfp4_k_scratch", v_cache, v_cache.dtype
+                )
+                torch.ops._C_cache_ops.reshape_and_cache_flash(
+                    key,
+                    value,
+                    scratch_k,
+                    v_cache,
+                    slot_mapping,
+                    self.kv_cache_dtype_v,
+                    layer._k_scale,
+                    layer._v_scale,
+                )
+                return
             k_cache = kv_cache[:, 0]
             v_cache = kv_cache[:, 1]
             torch.ops._C_cache_ops.reshape_and_cache_flash(

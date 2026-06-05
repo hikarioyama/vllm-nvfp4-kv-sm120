@@ -33,9 +33,50 @@ def generate_additional_params(
     additional_scalar_names: List[str],
     additional_scalar_dtypes: List[str],
     is_sm90_template: bool = False,
+    dtype_kv: str | None = None,
+    dtype_k: str | None = None,
+    dtype_v: str | None = None,
 ):
+    if dtype_k is None:
+        dtype_k = dtype_kv
+    if dtype_v is None:
+        dtype_v = dtype_kv
+
+    def _is_fp4_dtype(dtype: str | None) -> bool:
+        if dtype is None:
+            return True
+        dtype_name = str(dtype).lower()
+        # REVIEW(mixed): FlashInfer represents nvfp4 cache data as torch.uint8 in
+        # the Python wrapper, while fp8 K is torch.float8_e4m3fn and has no SF.
+        return (
+            "fp4" in dtype_name
+            or "nvfp4" in dtype_name
+            or "uint8" in dtype_name
+        )
+
     # SF tensors present in this variant (empty for non-NVFP4 / hopper variants).
-    sf_stride_vars = [v for v in additional_tensor_names if v in _SF_STRIDE_TENSORS]
+    # REVIEW(mixed): K/V SF Params are emitted independently, so K=fp8 does not
+    # generate or read maybe_k_cache_sf while V=nvfp4 still gets explicit strides.
+    sf_stride_vars = [
+        v
+        for v in additional_tensor_names
+        if v in _SF_STRIDE_TENSORS
+        and (
+            (v == "maybe_k_cache_sf" and _is_fp4_dtype(dtype_k))
+            or (v == "maybe_v_cache_sf" and _is_fp4_dtype(dtype_v))
+        )
+    ]
+    filtered = [
+        (dtype, var)
+        for dtype, var in zip(
+            additional_tensor_dtypes,
+            additional_tensor_names,
+            strict=True,
+        )
+        if var not in _SF_STRIDE_TENSORS or var in sf_stride_vars
+    ]
+    additional_tensor_dtypes = [dtype for dtype, _ in filtered]
+    additional_tensor_names = [var for _, var in filtered]
 
     additional_params_decl = "".join(
         [

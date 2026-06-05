@@ -559,6 +559,11 @@ __device__ __forceinline__ void page_produce_kv_sf(
       // smem store. All 4 cols share the row, so the single per-row in_bounds predicate gives
       // correct zero-fill of padding rows (compute_sfm_v needs 0, not NaN, for masked rows).
       // Requires SF_COLS % 4 == 0 (HEAD_DIM_VO % 64 == 0); Step3.7 HEAD_DIM_VO=128 -> SF_COLS=8.
+      // static_assert: fail to COMPILE on an unsupported head_dim rather than silently read a
+      // 32-bit V-SF word across a token-row boundary (would corrupt V scales, no NaN/crash).
+      static_assert(SF_COLS % 4 == 0,
+                    "B2 in-kernel V-SF de-swizzle requires HEAD_DIM_VO divisible by 64 "
+                    "(SF_COLS a multiple of 4)");
       uint32_t packed = 0;
       if (in_bounds) {
         constexpr uint32_t SF_GROUPS = SF_COLS / 4;  // sd // 4

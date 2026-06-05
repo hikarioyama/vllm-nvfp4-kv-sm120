@@ -8,6 +8,7 @@ FROM ${BASE_IMAGE}
 # /usr/local/lib/python3.12/dist-packages. Adjust SITE if your base uses a different path.
 ARG SITE=/usr/local/lib/python3.12/dist-packages
 COPY src/flashinfer/data/include/flashinfer/attention/prefill.cuh ${SITE}/flashinfer/data/include/flashinfer/attention/prefill.cuh
+COPY src/flashinfer/data/include/flashinfer/page.cuh              ${SITE}/flashinfer/data/include/flashinfer/page.cuh
 COPY src/flashinfer/jit/attention/utils.py                        ${SITE}/flashinfer/jit/attention/utils.py
 COPY src/vllm/v1/attention/backends/flashinfer.py                 ${SITE}/vllm/v1/attention/backends/flashinfer.py
 

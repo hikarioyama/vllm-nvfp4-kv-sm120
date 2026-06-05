@@ -25,11 +25,13 @@ Measured on Step-3.7-Flash (198B MoE, NVFP4 weights), 2× RTX PRO 6000 (SM120), 
   is **+0%**. The earlier interim approach ("B1") kept a contiguous de-swizzled V-SF cache (+5.5%) that
   was unaccounted by the profiler and forced util *below* fp8's, eating the gain back to ~1.5×. This
   version (B2) de-swizzles V-SF **in the kernel** → no scratch → util matches fp8 → full ceiling.
-- **Decode speed at parity** (~92–100% of fp8; single-stream 111.8 vs 114.6 tok/s, within noise).
+- **Decode speed at parity** (~91–100% of fp8; single-stream 111.8 vs 114.6 tok/s = 97.6%, within
+  run-to-run noise; min observed 91% at 4-way concurrency).
 - **MTP (speculative decode) compatible and validated** — +19% single-stream throughput, no backend
   change. CUDA-graph (`FULL_AND_PIECEWISE`) compatible.
-- **Quality:** fp8 KV is statistically lossless; NVFP4 KV costs **+0.01–0.02 nats/token PPL** (4–10×
-  the noise floor, monotonic), retrieval intact — see [`docs/KV_QUALITY_STUDY.md`](docs/KV_QUALITY_STUDY.md).
+- **Quality:** fp8 KV is statistically lossless; NVFP4 KV costs **+0.01–0.04 nats/token PPL** (≈4–15×
+  the noise floor, monotonic; worst at 8k context under MTP), retrieval intact — see
+  [`docs/KV_QUALITY_STUDY.md`](docs/KV_QUALITY_STUDY.md).
 
 ## How it works (1 paragraph)
 
@@ -95,7 +97,7 @@ docker build -t vllm-nvfp4-kv-sm120 --build-arg BASE_IMAGE=<your-vllm-image> .
 ./apply_patches.sh
 ```
 
-`apply_patches.sh` copies the three modified files (`src/`) over their site-packages locations (and
+`apply_patches.sh` copies the four modified files (`src/`) over their site-packages locations (and
 refuses to run if the detected vLLM/FlashInfer versions don't match, to avoid silent API mismatches).
 The equivalent unified diffs are in [`patches/`](patches/) for review (regenerated against the pinned
 versions; they apply cleanly and reproduce `src/` exactly).

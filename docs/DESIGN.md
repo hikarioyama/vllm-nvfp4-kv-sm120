@@ -61,8 +61,8 @@ needs **zero scratch** too.
 
 **Net: +0% SF over-allocation for both K and V.** No persistent SF cache, nothing hidden from the
 memory profiler, so `--gpu-memory-utilization` can sit right where fp8 runs and the **full ~1.78×
-byte ceiling is realized as real tokens** (≈1.79× measured vs fp8 at matched util). This is the
-"B2" design; it supersedes the +5.5% V-SF cache.
+byte ceiling is realized as real tokens** (1.78× measured vs fp8 at matched util 0.92: 2.96M vs
+1.66M tokens, MTP K=1). This is the "B2" design; it supersedes the +5.5% V-SF cache.
 
 ### Why the binding stays small
 
@@ -79,11 +79,14 @@ jinja edits, or binding signature changes are needed for the symmetric path.
 | file | change |
 |---|---|
 | `flashinfer/data/include/flashinfer/attention/prefill.cuh` | `page_produce_kv_sf` / `produce_kv_sf` take explicit `sf_stride_page/h/n`; V-SF read in place + **in-kernel 4-token de-swizzle**; 3 kernels (single/ragged/paged) split K/V strides across all call sites |
+| `flashinfer/data/include/flashinfer/page.cuh` | `paged_kv_t` independent V stride + `protective_get_{k,v}_offset` (split from `protective_get_kv_offset`) — **required**, `prefill.cuh` calls these so a cold JIT compile fails without it |
 | `flashinfer/jit/attention/utils.py` | `generate_additional_params` auto-emits stride fields + layout-aware setter for the `maybe_{k,v}_cache_sf` tensors |
 | `vllm/v1/attention/backends/flashinfer.py` | SM120 FA2 NVFP4-KV backend: K and V-SF both read directly from the interleaved cache view (no parallel scratch); SM120 gate `_use_fa2_for_nvfp4_kv_on_sm120()` |
 
-The three are also provided as reference unified diffs in [`patches/`](../patches/) (regenerated
-against the pinned versions; `apply_patches.sh` installs the full files from `src/`).
+The four (incl. `page.cuh`) are also provided as reference unified diffs in [`patches/`](../patches/)
+(regenerated against the pinned versions; `apply_patches.sh` installs the full files from `src/`).
+**`page.cuh` is required** — `prefill.cuh` calls `paged_kv_t::protective_get_{k,v}_offset` (the
+B2 split), which stock `page.cuh` does not define, so a cold JIT compile fails without it.
 
 ## Independent K/V precision (K=fp8 / V=nvfp4) — validated, serving wiring is follow-up
 

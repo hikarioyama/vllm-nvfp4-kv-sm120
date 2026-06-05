@@ -26,6 +26,7 @@ K="${K:-1}"
 BASE="http://127.0.0.1:${PORT}"
 
 T_PREFILL="/usr/local/lib/python3.12/dist-packages/flashinfer/data/include/flashinfer/attention/prefill.cuh"
+T_PAGE="/usr/local/lib/python3.12/dist-packages/flashinfer/data/include/flashinfer/page.cuh"
 T_UTILS="/usr/local/lib/python3.12/dist-packages/flashinfer/jit/attention/utils.py"
 T_VLLM="/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/flashinfer.py"
 
@@ -61,14 +62,18 @@ MOUNTS=()
 if [[ "$PATCHED" == "1" ]]; then
   PATCH="$SRC/nvfp4-fa2-patch/flashinfer.py"
   FI_PREFILL_CUH="$SRC/fi-src/flashinfer/attn/prefill.cuh"
+  FI_PAGE_CUH="$SRC/fi-src/flashinfer/attn/page.cuh"
   FI_UTILS_PY="$SRC/fi-src/flashinfer/jit/attention/utils.py"
-  for f in "$PATCH" "$FI_PREFILL_CUH" "$FI_UTILS_PY"; do
+  for f in "$PATCH" "$FI_PREFILL_CUH" "$FI_PAGE_CUH" "$FI_UTILS_PY"; do
     [[ -f "$f" ]] || { echo "!! missing patch file: $f" >&2; exit 1; }
   done
   [[ "${FRESH_JIT:-1}" == "1" ]] && rm -rf "$JIT"; mkdir -p "$JIT"
+  # page.cuh is REQUIRED: prefill.cuh calls paged_kv_t::protective_get_{k,v}_offset (B2 split),
+  # which stock page.cuh does not define — a cold JIT compile fails without this mount.
   MOUNTS=(-v "$JIT":/root/.cache/flashinfer
           -v "$PATCH":"$T_VLLM":ro
           -v "$FI_PREFILL_CUH":"$T_PREFILL":ro
+          -v "$FI_PAGE_CUH":"$T_PAGE":ro
           -v "$FI_UTILS_PY":"$T_UTILS":ro)
 fi
 

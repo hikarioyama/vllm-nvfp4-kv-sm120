@@ -32,6 +32,7 @@ backup_and_copy() {  # $1 = relative path under site-packages
 
 echo "applying:"
 backup_and_copy flashinfer/data/include/flashinfer/attention/prefill.cuh
+backup_and_copy flashinfer/data/include/flashinfer/page.cuh
 backup_and_copy flashinfer/jit/attention/utils.py
 backup_and_copy vllm/v1/attention/backends/flashinfer.py
 

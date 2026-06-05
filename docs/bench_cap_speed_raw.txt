@@ -33,3 +33,17 @@ saved step37_cap_nvfp4_0.93_mtp1.bench.json
 
 ########## DONE (MTP=1) ##########
 summary (KV pool tokens @ util):
+
+### MTP=0 reference (separate run, fp8 @ util 0.92, for the "MTP value" table) ###
+→ READY: KV=fp8 MTP=0 / GPU KV cache size: 1,667,816 tokens / Maximum concurrency for 131,072 tokens per request: 12.72x ✓
+--- decode speed (single + conc 1,2,4 aggregate, MTP=0) ---
+conc=1: 96.01 tok/s aggregate
+conc=2: 152.28 tok/s aggregate
+conc=4: 271.11 tok/s aggregate
+saved step37_cap_fp8_0.92.bench.json  (json present in ~/bench/results/)
+
+### COLD-JIT install validation (page.cuh + A1 fix; empty JIT cache, nvfp4 MTP=0 @ util 0.92) ###
+# Proves the 4-file documented install compiles the nvfp4 kernel from scratch on SM120.
+→ READY: KV=nvfp4 MTP=0 / GPU KV cache size: 3,046,467 tokens / Maximum concurrency for 131,072 tokens per request: 23.24x ✓
+smoke: "The capital of France is" -> " Paris. The capital"
+smoke: "what is a GPU?" -> coherent ("A GPU is a specialized processor designed to accelerate ...")

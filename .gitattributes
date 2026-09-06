@@ -1,0 +1,4 @@
+*.md text eol=lf
+*.patch text eol=lf whitespace=-blank-at-eol
+*.sh text eol=lf
+.gitignore text eol=lf
